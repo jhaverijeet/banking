@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: metric-diagnostics
+Version: 1.0.0
+Summary: Diagnose what drives a metric difference between two populations
+License: MIT
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: pandas>=1.5
+Requires-Dist: numpy>=1.23
+Requires-Dist: scikit-learn>=1.2
+Requires-Dist: python-pptx>=0.6.21
+Requires-Dist: openpyxl>=3.0
+Provides-Extra: lightgbm
+Requires-Dist: lightgbm>=3.3; extra == "lightgbm"
+Provides-Extra: all
+Requires-Dist: lightgbm>=3.3; extra == "all"

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "metric-diagnostics"
+version = "1.0.0"
+description = "Diagnose what drives a metric difference between two populations"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+
+dependencies = [
+    "pandas>=1.5",
+    "numpy>=1.23",
+    "scikit-learn>=1.2",
+    "python-pptx>=0.6.21",
+    "openpyxl>=3.0",
+]
+
+[project.optional-dependencies]
+lightgbm = ["lightgbm>=3.3"]
+all = ["lightgbm>=3.3"]
+
+[tool.setuptools.packages.find]
+include = ["metric_diagnostics*"]
