@@ -10,11 +10,14 @@ class AccountNPVEngine:
     Uses numpy broadcasting to process millions of accounts without Python loops.
     Attributes are configured as floats32 to optimize memory footprint and CPU cache usage.
     """
-    def __init__(self, num_months=99, annual_discount_rate=0.08, rdm_model_path=None, curve_model_paths=None):
+    def __init__(self, num_months=99, annual_discount_rate=0.08, rdm_model_path=None, curve_model_paths=None, constants_csv_path="constants.csv"):
         self.num_months = num_months
         
         # Base annual discount rate, will be combined with annual loss rate dynamically
         self.base_annual_discount_rate = np.float32(annual_discount_rate)
+        
+        # Load external static constants
+        self._load_constants(constants_csv_path)
 
         # Load external models if provided (LightGBM, sklearn, etc.)
         self.rdm_model = self._load_model(rdm_model_path) if rdm_model_path else None
@@ -37,6 +40,20 @@ class AccountNPVEngine:
             with open(path, 'rb') as f:
                 return pickle.load(f)
         return None
+
+    def _load_constants(self, csv_path):
+        """Read standard metric constraints (tax, capital rate, lgd) from CSV config."""
+        if os.path.exists(csv_path):
+            df_const = pd.read_csv(csv_path)
+            # Fetch from the very first row
+            self.tax_rate = np.float32(df_const['tax_rate'].iloc[0])
+            self.capital_requirement_rate = np.float32(df_const['capital_requirement_rate'].iloc[0])
+            self.lgd = np.float32(df_const['lgd'].iloc[0])
+        else:
+            # Safe Default values
+            self.tax_rate = np.float32(0.25)
+            self.capital_requirement_rate = np.float32(0.10)
+            self.lgd = np.float32(1.0)
         
     def score_initial_rdm_model(self, rdm_features):
         """
@@ -119,10 +136,17 @@ class AccountNPVEngine:
         :param c1, c2, c3, c4: curves of shape (num_accounts, 99)
         :return cashflows: shape (num_accounts, 99)
         """
-        # A simple illustration of mathematical formula using the 4 model outputs
-        # Evaluates element-wise across the matrices (num_accounts x 99)
-        # E.g., Cashflow = Balance(c2) * Rate - PD(c1)*Balance(c2) + Fees(c4) - Prepay(c3)*Balance(c2)
-        cashflows = (c2 * 0.02) - (c1 * c2) + c4 - (c3 * c2)
+        # Element-wise evaluation over millions of accounts utilizing constants
+        # c1=PD, c2=Balance, c3=Prepayment, c4=Fees
+        # Example Equation: Adjusted for Net Loss (PD * LGD) and final Tax deduction
+        
+        revenue_and_fees = (c2 * 0.02) + c4
+        expected_loss = (c1 * self.lgd) * c2
+        funding_costs = c3 * c2
+        
+        pre_tax_cashflow = revenue_and_fees - expected_loss - funding_costs
+        cashflows = pre_tax_cashflow * (1.0 - self.tax_rate)
+        
         return cashflows
 
     def calculate_annual_loss_rate(self, c1, c2):
@@ -137,7 +161,7 @@ class AccountNPVEngine:
         avg_bal_1yr = np.mean(c2_1yr, axis=1)
         safe_avg_bal = np.where(avg_bal_1yr == 0, 1e-9, avg_bal_1yr)
         
-        losses_1yr = np.sum(c1_1yr * c2_1yr, axis=1)
+        losses_1yr = np.sum((c1_1yr * self.lgd) * c2_1yr, axis=1)
         annual_loss_rate = losses_1yr / safe_avg_bal
         return annual_loss_rate
 
@@ -188,8 +212,8 @@ class AccountNPVEngine:
         safe_avg_bal = np.where(avg_bal_5yr == 0, 1e-9, avg_bal_5yr)
         
         # 1. 5-yr Net Loss Rate = Sum of Losses / Average Balance
-        # Losses = PD (c1) * Balance (c2)
-        losses_5yr = np.sum(c1_5yr * c2_5yr, axis=1)
+        # Losses = PD (c1) * LGD * Balance (c2)
+        losses_5yr = np.sum((c1_5yr * self.lgd) * c2_5yr, axis=1)
         net_loss_rate_5yr = losses_5yr / safe_avg_bal
         
         # 2. 5-yr ROA = Sum of Cashflows / Average Balance
@@ -197,8 +221,8 @@ class AccountNPVEngine:
         roa_5yr = total_cf_5yr / safe_avg_bal
         
         # 3. 5-yr ROE = Sum of Cashflows / Average Equity
-        # Assuming Equity = 10% of Average Balance
-        avg_equity_5yr = safe_avg_bal * 0.10
+        # Equity = Account Capital Requirement Rate * Average Balance
+        avg_equity_5yr = safe_avg_bal * self.capital_requirement_rate
         roe_5yr = total_cf_5yr / avg_equity_5yr
         
         # 4. Payback Period (months to positive cumulative cashflow)
