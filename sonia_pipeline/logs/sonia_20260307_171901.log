@@ -1,0 +1,12 @@
+2026-03-07 17:19:01,466  INFO      sonia_pipeline.database  Database initialised at C:\Users\jeetj\banking\sonia_rates.db
+2026-03-07 17:19:01,466  INFO      root  ============================================================
+2026-03-07 17:19:01,466  INFO      root  DAILY INCREMENTAL UPDATE
+2026-03-07 17:19:01,466  INFO      root  ============================================================
+2026-03-07 17:19:01,467  INFO      root  Latest date in DB: 2026-02-27
+2026-03-07 17:19:01,468  INFO      sonia_pipeline.fetcher  Incremental fetch for dates after 2026-02-27 …
+2026-03-07 17:19:01,481  INFO      sonia_pipeline.fetcher  Downloading BoE OIS archive from https://www.bankofengland.co.uk/-/media/boe/files/statistics/yield-curves/oisddata.zip …
+2026-03-07 17:19:02,479  INFO      sonia_pipeline.fetcher  Download complete – 11,331,006 bytes (HTTP 200).
+2026-03-07 17:19:02,483  INFO      sonia_pipeline.fetcher  Reading OIS daily data_2025 to present.xlsx / sheet '4. spot curve' …
+2026-03-07 17:19:02,610  INFO      sonia_pipeline.fetcher  Parsed 1 rows from OIS daily data_2025 to present.xlsx.
+2026-03-07 17:19:02,631  INFO      sonia_pipeline.fetcher  Incremental fetch found 0 new rows.
+2026-03-07 17:19:02,632  INFO      root  No new data available today.
