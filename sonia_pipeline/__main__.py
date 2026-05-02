@@ -22,8 +22,9 @@ import sys
 from datetime import datetime
 
 from .config import DB_PATH, HISTORY_YEARS, LOG_DIR
-from .database import get_latest_date, get_row_count, init_db, query_rates, upsert_rates
+from .database import get_latest_date, get_row_count, init_db, query_rates, upsert_rates, upsert_fred_rates, get_latest_fred_date
 from .fetcher import fetch_historical, fetch_latest
+from .fred_fetcher import fetch_fred_sonia, fetch_fred_latest
 
 
 def _setup_logging(verbose: bool = False) -> None:
@@ -46,30 +47,48 @@ def cmd_run(args: argparse.Namespace) -> None:
         logging.info("=" * 60)
         logging.info("HISTORICAL LOAD - last %d years", HISTORY_YEARS)
         logging.info("=" * 60)
-        df = fetch_historical()
-        n = upsert_rates(df)
-        logging.info("Historical load complete – %d rows written.", n)
+        
+        if getattr(args, "source", "boe") == "fred":
+            df = fetch_fred_sonia()
+            n = upsert_fred_rates(df)
+            logging.info("FRED historical load complete – %d rows written.", n)
+        else:
+            df = fetch_historical()
+            n = upsert_rates(df)
+            logging.info("BoE historical load complete – %d rows written.", n)
 
     elif args.mode == "daily":
         logging.info("=" * 60)
         logging.info("DAILY INCREMENTAL UPDATE")
         logging.info("=" * 60)
-        latest = get_latest_date()
-        logging.info("Latest date in DB: %s", latest or "(empty)")
-        df = fetch_latest(latest)
-        if df.empty:
-            logging.info("No new data available today.")
+        
+        source = getattr(args, "source", "boe")
+        if source == "fred":
+            latest = get_latest_fred_date()
+            logging.info("Latest FRED date in DB: %s", latest or "(empty)")
+            df = fetch_fred_latest(latest)
+            if df.empty:
+                logging.info("No new FRED data available today.")
+            else:
+                n = upsert_fred_rates(df)
+                logging.info("FRED daily update complete – %d new rows.", n)
         else:
-            n = upsert_rates(df)
-            logging.info("Daily update complete – %d new rows.", n)
-            
-            try:
-                from .sheets import push_to_sheets
-                push_to_sheets(df)
-            except ImportError:
-                logging.warning("Google Sheets module not found.")
-            except Exception as e:
-                logging.error(f"Error pushing to Sheets: {e}")
+            latest = get_latest_date()
+            logging.info("Latest BoE date in DB: %s", latest or "(empty)")
+            df = fetch_latest(latest)
+            if df.empty:
+                logging.info("No new BoE data available today.")
+            else:
+                n = upsert_rates(df)
+                logging.info("BoE daily update complete – %d new rows.", n)
+                
+                try:
+                    from .sheets import push_to_sheets
+                    push_to_sheets(df)
+                except ImportError:
+                    logging.warning("Google Sheets module not found.")
+                except Exception as e:
+                    logging.error(f"Error pushing to Sheets: {e}")
 
     else:
         logging.error("Unknown mode: %s", args.mode)
@@ -142,6 +161,12 @@ def main() -> None:
         choices=["historical", "daily"],
         default="daily",
         help="'historical' for full 5yr backfill; 'daily' for incremental update",
+    )
+    p_run.add_argument(
+        "--source",
+        choices=["boe", "fred"],
+        default="boe",
+        help="'boe' for OIS spot curve (default); 'fred' for overnight rate only",
     )
     p_run.add_argument("-v", "--verbose", action="store_true")
     p_run.set_defaults(func=cmd_run)

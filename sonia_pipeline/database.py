@@ -51,6 +51,15 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sonia_date ON sonia_rates(date);"
         )
+        
+        # --- FRED alternative table ---
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS sonia_overnight_fred (
+            date       TEXT PRIMARY KEY,
+            rate       REAL,
+            fetched_at TEXT NOT NULL
+        );
+        """)
     logger.info("Database initialised at %s", DB_PATH)
 
 
@@ -158,3 +167,40 @@ def query_rates(
     with _get_connection() as conn:
         df = pd.read_sql_query(sql, conn, params=params)
     return df
+
+# ─── FRED Alternative DB Functions ──────────────────────────────────────────
+
+def upsert_fred_rates(df: pd.DataFrame) -> int:
+    """Insert or update overnight rates from FRED."""
+    if df.empty:
+        return 0
+
+    now = datetime.utcnow().isoformat()
+    sql = """
+    INSERT INTO sonia_overnight_fred (date, rate, fetched_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(date) DO UPDATE SET rate=excluded.rate, fetched_at=excluded.fetched_at;
+    """
+
+    records = []
+    for _, row in df.iterrows():
+        date_val = row["date"]
+        if pd.isna(date_val):
+            continue
+        date_str = date_val.strftime("%Y-%m-%d") if hasattr(date_val, "strftime") else str(date_val)
+        rate_val = None if pd.isna(row.get("rate")) else float(row.get("rate"))
+        records.append([date_str, rate_val, now])
+
+    with _get_connection() as conn:
+        conn.executemany(sql, records)
+
+    logger.info("Upserted %d rows into sonia_overnight_fred.", len(records))
+    return len(records)
+
+def get_latest_fred_date() -> Optional[str]:
+    """Return the most recent date string in the FRED table, or None if empty."""
+    with _get_connection() as conn:
+        cur = conn.execute("SELECT MAX(date) FROM sonia_overnight_fred;")
+        result = cur.fetchone()
+    return result[0] if result and result[0] else None
+
