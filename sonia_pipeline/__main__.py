@@ -62,6 +62,14 @@ def cmd_run(args: argparse.Namespace) -> None:
         else:
             n = upsert_rates(df)
             logging.info("Daily update complete – %d new rows.", n)
+            
+            try:
+                from .sheets import push_to_sheets
+                push_to_sheets(df)
+            except ImportError:
+                logging.warning("Google Sheets module not found.")
+            except Exception as e:
+                logging.error(f"Error pushing to Sheets: {e}")
 
     else:
         logging.error("Unknown mode: %s", args.mode)
