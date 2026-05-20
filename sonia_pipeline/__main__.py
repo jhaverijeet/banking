@@ -20,9 +20,13 @@ import argparse
 import logging
 import sys
 from datetime import datetime
+from typing import Optional
+import pandas as pd
+import dlt
+from prefect import task, flow, get_run_logger
 
 from .config import DB_PATH, HISTORY_YEARS, LOG_DIR
-from .database import get_latest_date, get_row_count, init_db, query_rates, upsert_rates, upsert_fred_rates, get_latest_fred_date
+from .database import get_latest_date, get_row_count, init_db, query_rates, get_latest_fred_date
 from .fetcher import fetch_historical, fetch_latest
 from .fred_fetcher import fetch_fred_sonia, fetch_fred_latest
 
@@ -39,60 +43,106 @@ def _setup_logging(verbose: bool = False) -> None:
     logging.basicConfig(level=level, format=fmt, handlers=handlers)
 
 
-def cmd_run(args: argparse.Namespace) -> None:
-    """Run the data pipeline."""
+@task(name="Initialize Database")
+def initialize_database() -> None:
+    logger = get_run_logger()
+    logger.info("Initializing SQLite database tables...")
     init_db()
 
-    if args.mode == "historical":
-        logging.info("=" * 60)
-        logging.info("HISTORICAL LOAD - last %d years", HISTORY_YEARS)
-        logging.info("=" * 60)
-        
-        if getattr(args, "source", "boe") == "fred":
-            df = fetch_fred_sonia()
-            n = upsert_fred_rates(df)
-            logging.info("FRED historical load complete – %d rows written.", n)
-        else:
-            df = fetch_historical()
-            n = upsert_rates(df)
-            logging.info("BoE historical load complete – %d rows written.", n)
 
-    elif args.mode == "daily":
-        logging.info("=" * 60)
-        logging.info("DAILY INCREMENTAL UPDATE")
-        logging.info("=" * 60)
-        
-        source = getattr(args, "source", "boe")
+@task(name="Fetch Rates Data", retries=3, retry_delay_seconds=30)
+def fetch_data(mode: str, source: str, latest_date: Optional[str]) -> pd.DataFrame:
+    logger = get_run_logger()
+    if mode == "historical":
+        logger.info(f"Fetching historical data from {source.upper()}...")
         if source == "fred":
-            latest = get_latest_fred_date()
-            logging.info("Latest FRED date in DB: %s", latest or "(empty)")
-            df = fetch_fred_latest(latest)
-            if df.empty:
-                logging.info("No new FRED data available today.")
-            else:
-                n = upsert_fred_rates(df)
-                logging.info("FRED daily update complete – %d new rows.", n)
+            return fetch_fred_sonia()
         else:
-            latest = get_latest_date()
-            logging.info("Latest BoE date in DB: %s", latest or "(empty)")
-            df = fetch_latest(latest)
-            if df.empty:
-                logging.info("No new BoE data available today.")
-            else:
-                n = upsert_rates(df)
-                logging.info("BoE daily update complete – %d new rows.", n)
-                
-                try:
-                    from .sheets import push_to_sheets
-                    push_to_sheets(df)
-                except ImportError:
-                    logging.warning("Google Sheets module not found.")
-                except Exception as e:
-                    logging.error(f"Error pushing to Sheets: {e}")
-
+            return fetch_historical()
     else:
-        logging.error("Unknown mode: %s", args.mode)
-        sys.exit(1)
+        logger.info(f"Fetching latest data from {source.upper()} since {latest_date or 'beginning'}...")
+        if source == "fred":
+            return fetch_fred_latest(latest_date)
+        else:
+            return fetch_latest(latest_date)
+
+
+@task(name="Load Data via dlt (Merge)")
+def load_data_with_dlt(df: pd.DataFrame, table_name: str) -> int:
+    logger = get_run_logger()
+    if df.empty:
+        logger.info("DataFrame is empty. Nothing to load.")
+        return 0
+
+    @dlt.resource(
+        name=table_name,
+        primary_key="date",
+        write_disposition="merge"
+    )
+    def load_resource():
+        df_copy = df.copy()
+        df_copy["fetched_at"] = datetime.utcnow().isoformat()
+        if "date" in df_copy.columns:
+            df_copy["date"] = pd.to_datetime(df_copy["date"]).dt.strftime("%Y-%m-%d")
+        yield df_copy.to_dict(orient="records")
+
+    logger.info(f"Running DLT pipeline to load data into '{table_name}' table...")
+    pipeline = dlt.pipeline(
+        pipeline_name=f"sonia_{table_name}_pipeline",
+        destination=dlt.destinations.sqlalchemy(f"sqlite:///{DB_PATH.absolute()}"),
+        dataset_name="main"
+    )
+    load_info = pipeline.run(load_resource())
+    logger.info(f"DLT pipeline loaded successfully. Info:\n{load_info}")
+    return len(df)
+
+
+@task(name="Push to Google Sheets", retries=2, retry_delay_seconds=15)
+def push_to_sheets_task(df: pd.DataFrame) -> None:
+    logger = get_run_logger()
+    logger.info("Pushing data to Google Sheets...")
+    try:
+        from .sheets import push_to_sheets
+        push_to_sheets(df)
+    except ImportError:
+        logger.warning("Google Sheets module not found.")
+    except Exception as e:
+        logger.error(f"Error pushing to Sheets: {e}")
+
+
+@flow(name="SONIA Rate Pipeline Flow")
+def run_sonia_pipeline_flow(mode: str, source: str) -> None:
+    logger = get_run_logger()
+    logger.info(f"Starting SONIA Rate Pipeline Flow (Mode: {mode}, Source: {source})")
+    
+    # 1. Init Database
+    initialize_database()
+    
+    # 2. Get high-water mark for incremental run
+    latest_date = None
+    if mode == "daily":
+        if source == "fred":
+            latest_date = get_latest_fred_date()
+        else:
+            latest_date = get_latest_date()
+            
+    # 3. Fetch rates data
+    df = fetch_data(mode, source, latest_date)
+    
+    # 4. Load rates data using dlt
+    table_name = "sonia_overnight_fred" if source == "fred" else "sonia_rates"
+    rows_written = load_data_with_dlt(df, table_name)
+    
+    # 5. Push to Sheets if daily BOE data loaded successfully
+    if rows_written > 0 and mode == "daily" and source == "boe":
+        push_to_sheets_task(df)
+        
+    logger.info("SONIA Rate Pipeline Flow completed successfully.")
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    """Run the data pipeline flow."""
+    run_sonia_pipeline_flow(mode=args.mode, source=getattr(args, "source", "boe"))
 
 
 def cmd_query(args: argparse.Namespace) -> None:
