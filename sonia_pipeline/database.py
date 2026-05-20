@@ -40,9 +40,11 @@ def init_db() -> None:
     cols_ddl = ",\n    ".join(f"{c} REAL" for c in TENOR_COLUMNS)
     ddl = f"""
     CREATE TABLE IF NOT EXISTS sonia_rates (
-        date       TEXT PRIMARY KEY,
+        date         TEXT PRIMARY KEY,
         {cols_ddl},
-        fetched_at TEXT NOT NULL
+        fetched_at   TEXT NOT NULL,
+        _dlt_load_id TEXT,
+        _dlt_id      TEXT
     );
     """
     with _get_connection() as conn:
@@ -55,9 +57,11 @@ def init_db() -> None:
         # --- FRED alternative table ---
         conn.execute("""
         CREATE TABLE IF NOT EXISTS sonia_overnight_fred (
-            date       TEXT PRIMARY KEY,
-            rate       REAL,
-            fetched_at TEXT NOT NULL
+            date         TEXT PRIMARY KEY,
+            rate         REAL,
+            fetched_at   TEXT NOT NULL,
+            _dlt_load_id TEXT,
+            _dlt_id      TEXT
         );
         """)
     logger.info("Database initialised at %s", DB_PATH)
