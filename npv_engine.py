@@ -1,310 +1,470 @@
+import os
+import pickle
+import time
+from pathlib import Path
+from typing import Any, Optional, Sequence, Tuple
+
 import numpy as np
 import pandas as pd
-import time
-import pickle
-import os
+
 
 class AccountNPVEngine:
+    """Vectorized account-level NPV engine with validated, chunked processing.
+
+    The engine expects trained models in production. The deterministic dummy
+    models are available only when ``allow_demo_fallback=True``.
     """
-    Highly efficient Vectorized Account-Level NPV Model Engine.
-    Uses numpy broadcasting to process millions of accounts without Python loops.
-    Attributes are configured as floats32 to optimize memory footprint and CPU cache usage.
-    """
-    def __init__(self, num_months=99, annual_discount_rate=0.08, rdm_model_path=None, curve_model_paths=None, constants_csv_path="constants.csv"):
-        self.num_months = num_months
-        
-        # Base annual discount rate, will be combined with annual loss rate dynamically
+
+    REQUIRED_CONSTANTS = ("tax_rate", "capital_requirement_rate", "lgd")
+
+    def __init__(
+        self,
+        num_months: int = 99,
+        annual_discount_rate: float = 0.08,
+        rdm_model_path: Optional[Any] = None,
+        curve_model_paths: Optional[Sequence[Any]] = None,
+        constants_csv_path: Optional[os.PathLike] = None,
+        chunk_size: int = 10_000,
+        allow_demo_fallback: bool = False,
+        credit_risk_premium: float = 0.0,
+    ):
+        if not isinstance(num_months, (int, np.integer)) or num_months <= 0:
+            raise ValueError("num_months must be a positive integer")
+        if not isinstance(chunk_size, (int, np.integer)) or chunk_size <= 0:
+            raise ValueError("chunk_size must be a positive integer")
+        if not np.isfinite(annual_discount_rate) or annual_discount_rate <= -1.0:
+            raise ValueError("annual_discount_rate must be finite and greater than -1")
+        if not np.isfinite(credit_risk_premium) or credit_risk_premium < 0.0:
+            raise ValueError("credit_risk_premium must be finite and non-negative")
+
+        self.num_months = int(num_months)
+        self.chunk_size = int(chunk_size)
+        self.allow_demo_fallback = bool(allow_demo_fallback)
         self.base_annual_discount_rate = np.float32(annual_discount_rate)
-        
-        # Load external static constants
+        self.credit_risk_premium = np.float32(credit_risk_premium)
+        self.months_array = np.arange(1, self.num_months + 1, dtype=np.float32)
+        self._demo_curve_coefficients = {}
+
         self._load_constants(constants_csv_path)
 
-        # Load external models if provided (LightGBM, sklearn, etc.)
-        self.rdm_model = self._load_model(rdm_model_path) if rdm_model_path else None
-        
-        if curve_model_paths and len(curve_model_paths) == 4:
-            self.curve_models = [self._load_model(p) for p in curve_model_paths]
+        if rdm_model_path is None:
+            if not self.allow_demo_fallback:
+                raise ValueError(
+                    "rdm_model_path is required; use allow_demo_fallback=True "
+                    "only for deterministic demonstrations"
+                )
+            self.rdm_model = None
         else:
+            self.rdm_model = self._load_model(rdm_model_path, "rdm_model")
+
+        if curve_model_paths is None:
+            if not self.allow_demo_fallback:
+                raise ValueError(
+                    "exactly four curve models are required; use "
+                    "allow_demo_fallback=True only for deterministic demonstrations"
+                )
             self.curve_models = None
-        
-        # 1. Initial Regression Model (RDM) Configurations
-        # We assume 5 features. These are dummy regression weights for the Risk Driver Metric.
+        else:
+            if len(curve_model_paths) != 4:
+                raise ValueError("curve_model_paths must contain exactly four models")
+            self.curve_models = [
+                self._load_model(model_path, f"curve_model_{index + 1}")
+                for index, model_path in enumerate(curve_model_paths)
+            ]
+
+        # Fallback RDM coefficients are retained only for explicit demo mode.
         self.rdm_coefs = np.array([0.45, -0.15, 0.22, 0.05, -0.30], dtype=np.float32)
         self.rdm_intercept = np.float32(1.2)
-        
-    def _load_model(self, path):
-        """Helper to load a pickle file or return the object if it's already a model."""
-        if hasattr(path, 'predict'):
-            return path
-        if isinstance(path, str) and os.path.exists(path):
-            with open(path, 'rb') as f:
-                return pickle.load(f)
-        return None
 
-    def _load_constants(self, csv_path):
-        """Read standard metric constraints (tax, capital rate, lgd) from CSV config."""
-        if os.path.exists(csv_path):
-            df_const = pd.read_csv(csv_path)
-            # Fetch from the very first row
-            self.tax_rate = np.float32(df_const['tax_rate'].iloc[0])
-            self.capital_requirement_rate = np.float32(df_const['capital_requirement_rate'].iloc[0])
-            self.lgd = np.float32(df_const['lgd'].iloc[0])
+    def _load_model(self, model_or_path: Any, model_name: str) -> Any:
+        """Load a model and fail clearly if it is missing or unusable."""
+        if hasattr(model_or_path, "predict"):
+            model = model_or_path
         else:
-            # Safe Default values
-            self.tax_rate = np.float32(0.25)
-            self.capital_requirement_rate = np.float32(0.10)
-            self.lgd = np.float32(1.0)
-        
-    def score_initial_rdm_model(self, rdm_features):
+            if not isinstance(model_or_path, (str, os.PathLike)):
+                raise TypeError(f"{model_name} must be a model object or filesystem path")
+            model_path = Path(model_or_path)
+            if not model_path.is_file():
+                raise FileNotFoundError(f"{model_name} was not found: {model_path}")
+            with model_path.open("rb") as model_file:
+                model = pickle.load(model_file)
+
+        if not hasattr(model, "predict"):
+            raise TypeError(f"{model_name} must expose a predict method")
+        return model
+
+    def _load_constants(self, csv_path: Optional[os.PathLike]) -> None:
+        """Load and validate the single-row constants configuration."""
+        if csv_path is None:
+            constants_path = Path(__file__).resolve().with_name("constants.csv")
+        else:
+            constants_path = Path(csv_path)
+
+        if not constants_path.is_file():
+            raise FileNotFoundError(f"Constants CSV was not found: {constants_path}")
+
+        df_const = pd.read_csv(constants_path)
+        missing = [name for name in self.REQUIRED_CONSTANTS if name not in df_const.columns]
+        if missing:
+            raise ValueError(
+                f"Constants CSV must have columns {self.REQUIRED_CONSTANTS}; "
+                f"missing {missing}: {constants_path}"
+            )
+        if len(df_const) != 1:
+            raise ValueError(
+                f"Constants CSV must contain exactly one data row: {constants_path}"
+            )
+
+        values = {}
+        for name in self.REQUIRED_CONSTANTS:
+            try:
+                value = float(df_const.loc[0, name])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Constant {name!r} must be numeric") from exc
+            if not np.isfinite(value):
+                raise ValueError(f"Constant {name!r} must be finite")
+            values[name] = value
+
+        if not 0.0 <= values["tax_rate"] <= 1.0:
+            raise ValueError("tax_rate must be between 0 and 1")
+        if not 0.0 < values["capital_requirement_rate"] <= 1.0:
+            raise ValueError("capital_requirement_rate must be greater than 0 and at most 1")
+        if not 0.0 <= values["lgd"] <= 1.0:
+            raise ValueError("lgd must be between 0 and 1")
+
+        self.tax_rate = np.float32(values["tax_rate"])
+        self.capital_requirement_rate = np.float32(values["capital_requirement_rate"])
+        self.lgd = np.float32(values["lgd"])
+
+    @staticmethod
+    def _as_feature_array(values: Any, name: str) -> np.ndarray:
+        array = np.asarray(values, dtype=np.float32)
+        if array.ndim != 2:
+            raise ValueError(f"{name} must be a two-dimensional numeric array")
+        if not np.isfinite(array).all():
+            raise ValueError(f"{name} contains NaN or infinite values")
+        return array
+
+    def _validate_features(
+        self, rdm_features: Any, other_features: Any
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        rdm_array = self._as_feature_array(rdm_features, "rdm_features")
+        other_array = self._as_feature_array(other_features, "other_features")
+        if rdm_array.shape[1] != 5:
+            raise ValueError(f"rdm_features must have exactly 5 columns, got {rdm_array.shape[1]}")
+        if rdm_array.shape[0] != other_array.shape[0]:
+            raise ValueError("rdm_features and other_features must have the same row count")
+        return rdm_array, other_array
+
+    @staticmethod
+    def _validate_curve_shapes(curves: Sequence[np.ndarray], expected_shape: Tuple[int, int]) -> None:
+        for index, curve in enumerate(curves, start=1):
+            if curve.shape != expected_shape:
+                raise ValueError(
+                    f"curve_{index} must have shape {expected_shape}, got {curve.shape}"
+                )
+            if not np.isfinite(curve).all():
+                raise ValueError(f"curve_{index} contains NaN or infinite values")
+
+    @staticmethod
+    def _bound_curves(curves: Sequence[np.ndarray]) -> Tuple[np.ndarray, ...]:
+        """Apply domain bounds to model outputs.
+
+        c1 is probability of default, c2 is balance, c3 is prepayment rate,
+        and c4 is a fee amount that may be positive or negative.
         """
-        Scores the initial RDM regression model using 5 characteristics.
-        Produces a single number output per account.
-        
-        :param rdm_features: shape (num_accounts, 5)
-        :return rdm: shape (num_accounts,)
-        """
+        c1, c2, c3, c4 = curves
+        return (
+            np.clip(c1, 0.0, 1.0),
+            np.maximum(c2, 0.0),
+            np.clip(c3, 0.0, 1.0),
+            c4,
+        )
+
+    def score_initial_rdm_model(self, rdm_features: Any) -> np.ndarray:
+        """Score one RDM value per account."""
+        rdm_array = self._as_feature_array(rdm_features, "rdm_features")
+        if rdm_array.shape[1] != 5:
+            raise ValueError(f"rdm_features must have exactly 5 columns, got {rdm_array.shape[1]}")
+
         if self.rdm_model is not None:
-            # Predict using the loaded scikit-learn or LightGBM model
-            return self.rdm_model.predict(rdm_features).astype(np.float32)
-            
-        # Vectorized dot product across all accounts (Fallback)
-        return np.dot(rdm_features, self.rdm_coefs) + self.rdm_intercept
-
-    def score_curve_models(self, rdm, other_features):
-        """
-        Scores 4 distinct regression models that produce curves over 99 months.
-        Using RDM, other characteristics, and month on book (1 to 99).
-        
-        :param rdm: shape (num_accounts,)
-        :param other_features: shape (num_accounts, num_other_features)
-        :return c1, c2, c3, c4: curves each of shape (num_accounts, 99)
-        """
-        num_accounts = rdm.shape[0]
-        
-        # Combine RDM output and other characteristics into a single feature matrix
-        base_features = np.column_stack((rdm, other_features))
-        num_base_features = base_features.shape[1]
-        
-        # Repeat each account's features 99 times
-        # Shape: (num_accounts * 99, num_base_features)
-        repeated_features = np.repeat(base_features, self.num_months, axis=0)
-        
-        # Create an array for month on book (1 to 99) repeated for each account
-        # Shape: (num_accounts * 99,)
-        mob_array = np.tile(np.arange(1, self.num_months + 1, dtype=np.float32), num_accounts)
-        
-        # Combine the repeated features with the month on book
-        # Shape: (num_accounts * 99, num_base_features + 1)
-        expanded_features = np.column_stack((repeated_features, mob_array))
-        
-        # Convert to a DataFrame as the models (like GBM) often expect feature names or a DataFrame structure
-        feature_cols = [f"feature_{i}" for i in range(num_base_features)] + ["month_on_book"]
-        df_features = pd.DataFrame(expanded_features, columns=feature_cols)
-        
-        # Calculate actual curve values for each account-month observation
-        if self.curve_models is not None:
-            # Use loaded models (LightGBM / sklearn) predicting directly over the dataframe
-            flat_curve_1 = self.curve_models[0].predict(df_features).astype(np.float32)
-            flat_curve_2 = self.curve_models[1].predict(df_features).astype(np.float32)
-            flat_curve_3 = self.curve_models[2].predict(df_features).astype(np.float32)
-            flat_curve_4 = self.curve_models[3].predict(df_features).astype(np.float32)
+            predictions = self.rdm_model.predict(rdm_array)
         else:
-            # Fallback to dummy matrix dot product (simulating the models predicting the actual curves)
-            np.random.seed(42)  # Fixed for dummy consistency
-            coef_1 = np.random.randn(num_base_features + 1).astype(np.float32) * 0.01
-            coef_2 = np.random.randn(num_base_features + 1).astype(np.float32) * 0.05
-            coef_3 = np.random.randn(num_base_features + 1).astype(np.float32) * 0.02
-            coef_4 = np.random.randn(num_base_features + 1).astype(np.float32) * 1.5
-            
-            flat_curve_1 = np.dot(expanded_features, coef_1)
-            flat_curve_2 = np.dot(expanded_features, coef_2) 
-            flat_curve_3 = np.dot(expanded_features, coef_3)
-            flat_curve_4 = np.dot(expanded_features, coef_4)
-        
-        # Reshape the flat predictions back into (num_accounts, 99) matrices
-        curve_1 = flat_curve_1.reshape(num_accounts, self.num_months)
-        curve_2 = flat_curve_2.reshape(num_accounts, self.num_months)
-        curve_3 = flat_curve_3.reshape(num_accounts, self.num_months)
-        curve_4 = flat_curve_4.reshape(num_accounts, self.num_months)
-        
-        return curve_1, curve_2, curve_3, curve_4
+            predictions = np.dot(rdm_array, self.rdm_coefs) + self.rdm_intercept
 
-    def calculate_cashflows(self, c1, c2, c3, c4):
-        """
-        Combines curves using mathematical formula to calculate 99 month cashflow
-        
-        :param c1, c2, c3, c4: curves of shape (num_accounts, 99)
-        :return cashflows: shape (num_accounts, 99)
-        """
-        # Element-wise evaluation over millions of accounts utilizing constants
-        # c1=PD, c2=Balance, c3=Prepayment, c4=Fees
-        # Example Equation: Adjusted for Net Loss (PD * LGD) and final Tax deduction
-        
-        revenue_and_fees = (c2 * 0.02) + c4
-        expected_loss = (c1 * self.lgd) * c2
-        funding_costs = c3 * c2
-        
-        pre_tax_cashflow = revenue_and_fees - expected_loss - funding_costs
-        cashflows = pre_tax_cashflow * (1.0 - self.tax_rate)
-        
+        rdm = np.asarray(predictions, dtype=np.float32).reshape(-1)
+        if rdm.shape[0] != rdm_array.shape[0]:
+            raise ValueError(
+                f"rdm model returned {rdm.shape[0]} predictions for {rdm_array.shape[0]} accounts"
+            )
+        if not np.isfinite(rdm).all():
+            raise ValueError("rdm model returned NaN or infinite values")
+        return rdm
+
+    def _get_demo_curve_coefficients(self, num_base_features: int) -> Tuple[np.ndarray, ...]:
+        if num_base_features not in self._demo_curve_coefficients:
+            rng = np.random.default_rng(42)
+            self._demo_curve_coefficients[num_base_features] = tuple(
+                rng.normal(size=num_base_features + 1).astype(np.float32) * scale
+                for scale in (0.01, 0.05, 0.02, 1.5)
+            )
+        return self._demo_curve_coefficients[num_base_features]
+
+    def score_curve_models(self, rdm: Any, other_features: Any) -> Tuple[np.ndarray, ...]:
+        """Score four account-month curves in bounded memory chunks."""
+        rdm_array = np.asarray(rdm, dtype=np.float32).reshape(-1)
+        other_array = self._as_feature_array(other_features, "other_features")
+        if rdm_array.shape[0] != other_array.shape[0]:
+            raise ValueError("rdm and other_features must have the same row count")
+        if not np.isfinite(rdm_array).all():
+            raise ValueError("rdm contains NaN or infinite values")
+
+        num_accounts = rdm_array.shape[0]
+        base_features = np.column_stack((rdm_array, other_array)).astype(np.float32, copy=False)
+        num_base_features = base_features.shape[1]
+        curves = tuple(
+            np.empty((num_accounts, self.num_months), dtype=np.float32) for _ in range(4)
+        )
+
+        for start in range(0, num_accounts, self.chunk_size):
+            end = min(start + self.chunk_size, num_accounts)
+            chunk_accounts = end - start
+            repeated_features = np.repeat(base_features[start:end], self.num_months, axis=0)
+            expanded_features = np.empty(
+                (chunk_accounts * self.num_months, num_base_features + 1), dtype=np.float32
+            )
+            expanded_features[:, :-1] = repeated_features
+            expanded_features[:, -1] = np.tile(self.months_array, chunk_accounts)
+
+            if self.curve_models is not None:
+                feature_cols = [f"feature_{i}" for i in range(num_base_features)] + [
+                    "month_on_book"
+                ]
+                model_features = pd.DataFrame(expanded_features, columns=feature_cols)
+                predictions = [model.predict(model_features) for model in self.curve_models]
+            else:
+                coefficients = self._get_demo_curve_coefficients(num_base_features)
+                predictions = [np.dot(expanded_features, coefficient) for coefficient in coefficients]
+
+            for curve, prediction in zip(curves, predictions):
+                flat_prediction = np.asarray(prediction, dtype=np.float32).reshape(-1)
+                expected_size = chunk_accounts * self.num_months
+                if flat_prediction.size != expected_size:
+                    raise ValueError(
+                        f"curve model returned {flat_prediction.size} values; expected {expected_size}"
+                    )
+                if not np.isfinite(flat_prediction).all():
+                    raise ValueError("curve model returned NaN or infinite values")
+                curve[start:end] = flat_prediction.reshape(chunk_accounts, self.num_months)
+
+        return self._bound_curves(curves)
+
+    def calculate_cashflows(
+        self, c1: np.ndarray, c2: np.ndarray, c3: np.ndarray, c4: np.ndarray
+    ) -> np.ndarray:
+        """Combine bounded curves into after-tax monthly cash flows."""
+        curves = tuple(np.asarray(curve, dtype=np.float32) for curve in (c1, c2, c3, c4))
+        expected_shape = (curves[0].shape[0], self.num_months)
+        self._validate_curve_shapes(curves, expected_shape)
+        c1, c2, c3, c4 = self._bound_curves(curves)
+
+        cashflows = np.empty_like(c2, dtype=np.float32)
+        work = np.empty_like(c2, dtype=np.float32)
+        np.multiply(c2, np.float32(0.02), out=cashflows)
+        cashflows += c4
+        np.multiply(c1, self.lgd, out=work)
+        np.multiply(work, c2, out=work)
+        cashflows -= work
+        np.multiply(c3, c2, out=work)
+        cashflows -= work
+        cashflows *= np.float32(1.0 - self.tax_rate)
+
+        if not np.isfinite(cashflows).all():
+            raise ValueError("cash-flow calculation returned NaN or infinite values")
         return cashflows
 
-    def calculate_annual_loss_rate(self, c1, c2):
-        """
-        Calculate a 1-year (first 12 months) annualized loss rate for each account.
-        Assumes c1 is PD (loss rate) and c2 is Balance.
-        """
-        months_1yr = min(12, self.num_months)
-        c1_1yr = c1[:, :months_1yr]
-        c2_1yr = c2[:, :months_1yr]
-        
-        avg_bal_1yr = np.mean(c2_1yr, axis=1)
-        safe_avg_bal = np.where(avg_bal_1yr == 0, 1e-9, avg_bal_1yr)
-        
-        losses_1yr = np.sum((c1_1yr * self.lgd) * c2_1yr, axis=1)
-        annual_loss_rate = losses_1yr / safe_avg_bal
-        return annual_loss_rate
+    def calculate_annual_loss_rate(self, c1: np.ndarray, c2: np.ndarray) -> np.ndarray:
+        """Calculate a simple annualized, exposure-weighted loss rate.
 
-    def calculate_npv(self, cashflows, annual_loss_rate):
+        The model curves are interpreted as monthly rates. The result is the
+        exposure-weighted average monthly expected loss multiplied by 12 (or
+        annualized when fewer than 12 months are available). It is reported as
+        a metric only; it is not automatically added to the NPV discount rate.
         """
-        Discount 99-month cashflows to get a single NPV number per account.
-        Discount rate is dynamically calculated per account: base_rate + annual_loss_rate
-        
-        :param cashflows: shape (num_accounts, 99)
-        :param annual_loss_rate: shape (num_accounts,)
-        :return npv: shape (num_accounts,)
+        c1_array = np.asarray(c1, dtype=np.float32)
+        c2_array = np.asarray(c2, dtype=np.float32)
+        expected_shape = (c1_array.shape[0], self.num_months)
+        self._validate_curve_shapes((c1_array, c2_array), expected_shape)
+        c1_array, c2_array = self._bound_curves((c1_array, c2_array, c1_array, c2_array))[:2]
+
+        months = min(12, self.num_months)
+        exposure = np.sum(c2_array[:, :months], axis=1, dtype=np.float64)
+        losses = np.sum(
+            c1_array[:, :months] * self.lgd * c2_array[:, :months], axis=1, dtype=np.float64
+        )
+        annual_loss_rate = np.divide(
+            losses * (12.0 / months),
+            exposure,
+            out=np.zeros_like(losses),
+            where=exposure > 0.0,
+        )
+        return annual_loss_rate.astype(np.float32)
+
+    def calculate_npv(
+        self, cashflows: np.ndarray, credit_risk_premium: Optional[Any] = None
+    ) -> np.ndarray:
+        """Discount cash flows without re-adding expected losses.
+
+        ``credit_risk_premium`` is an optional, separately calibrated premium;
+        expected loss rates must not be passed here because expected losses are
+        already included in the cash flows.
         """
-        # Calculate dynamic discount rate for each account
-        annual_discount_rates = self.base_annual_discount_rate + annual_loss_rate
-        monthly_discount_rates = annual_discount_rates / 12.0
-        
-        months_array = np.arange(1, self.num_months + 1, dtype=np.float32)
-        
-        # Broadcast monthly rates (num_accounts, 1) to months_array (99,) creating a (num_accounts, 99) discount matrix
-        discount_factors = 1.0 / ((1.0 + monthly_discount_rates[:, None]) ** months_array)
-        
-        # Multiply cashflow matrix by discount factor matrix, then sum
-        npv = np.sum(cashflows * discount_factors, axis=1)
+        cashflow_array = np.asarray(cashflows, dtype=np.float32)
+        if cashflow_array.ndim != 2 or cashflow_array.shape[1] != self.num_months:
+            raise ValueError(
+                f"cashflows must have shape (num_accounts, {self.num_months})"
+            )
+        if not np.isfinite(cashflow_array).all():
+            raise ValueError("cashflows contains NaN or infinite values")
+
+        if credit_risk_premium is None:
+            premium = np.full(
+                cashflow_array.shape[0], self.credit_risk_premium, dtype=np.float32
+            )
+        else:
+            premium = np.asarray(credit_risk_premium, dtype=np.float32)
+            if premium.ndim == 0:
+                premium = np.full(cashflow_array.shape[0], premium, dtype=np.float32)
+            elif premium.shape != (cashflow_array.shape[0],):
+                raise ValueError("credit_risk_premium must be scalar or one value per account")
+        if not np.isfinite(premium).all() or np.any(premium < 0.0):
+            raise ValueError("credit_risk_premium must be finite and non-negative")
+
+        annual_rates = self.base_annual_discount_rate + premium
+        monthly_rates = annual_rates / np.float32(12.0)
+        if np.any(1.0 + monthly_rates <= 0.0):
+            raise ValueError("discount rate produces a non-positive monthly discount base")
+
+        npv = np.empty(cashflow_array.shape[0], dtype=np.float64)
+        for start in range(0, cashflow_array.shape[0], self.chunk_size):
+            end = min(start + self.chunk_size, cashflow_array.shape[0])
+            discount_factors = 1.0 / np.power(
+                1.0 + monthly_rates[start:end, None], self.months_array[None, :]
+            )
+            npv[start:end] = np.sum(
+                cashflow_array[start:end] * discount_factors, axis=1, dtype=np.float64
+            )
         return npv
 
-    def calculate_metrics(self, c1, c2, cashflows, npv):
-        """
-        Calculate additional business metrics efficiently across all accounts.
-        Assumes c1 is PD (loss rate) and c2 is Balance.
-        
-        Calculates:
-        - 5-yr Net Loss Rate
-        - 5-yr Return on Asset (ROA)
-        - 5-yr Return on Equity (ROE) - Assumes Equity is 10% of Balance
-        - Payback Period (months)
-        """
-        # We look at 5 years (60 months), ensuring we don't exceed the num_months
-        months_5yr = min(60, self.num_months)
-        
-        # Slices for first 5 years
-        c1_5yr = c1[:, :months_5yr]
-        c2_5yr = c2[:, :months_5yr]
-        cf_5yr = cashflows[:, :months_5yr]
-        
-        # 5-yr Average Balance (Denominator for rates)
-        avg_bal_5yr = np.mean(c2_5yr, axis=1)
-        # Avoid division by zero
-        safe_avg_bal = np.where(avg_bal_5yr == 0, 1e-9, avg_bal_5yr)
-        
-        # 1. 5-yr Net Loss Rate = Sum of Losses / Average Balance
-        # Losses = PD (c1) * LGD * Balance (c2)
-        losses_5yr = np.sum((c1_5yr * self.lgd) * c2_5yr, axis=1)
-        net_loss_rate_5yr = losses_5yr / safe_avg_bal
-        
-        # 2. 5-yr ROA = Sum of Cashflows / Average Balance
-        total_cf_5yr = np.sum(cf_5yr, axis=1)
-        roa_5yr = total_cf_5yr / safe_avg_bal
-        
-        # 3. 5-yr ROE = Sum of Cashflows / Average Equity
-        # Equity = Account Capital Requirement Rate * Average Balance
-        avg_equity_5yr = safe_avg_bal * self.capital_requirement_rate
-        roe_5yr = total_cf_5yr / avg_equity_5yr
-        
-        # 4. Payback Period (months to positive cumulative cashflow)
-        # Calculate cumulative sum of cashflows along the months axis
-        cum_cf = np.cumsum(cashflows, axis=1)
-        
-        # Find the first month (index) where cumulative cashflow > 0
-        # argmax returns the first index where condition is true.
-        # We add 1 because month on book is 1-indexed (and indices are 0-indexed)
-        positive_mask = cum_cf > 0
-        payback_period = np.argmax(positive_mask, axis=1) + 1
-        
-        # If the account never pays back, it assigns a 0 payback. We can fix this by
-        # explicitly setting those that never cross 0 to a default value like -1 or NaN.
-        never_paid_back = ~np.any(positive_mask, axis=1)
-        payback_period = np.where(never_paid_back, -1, payback_period)
-        
-        return net_loss_rate_5yr, roa_5yr, roe_5yr, payback_period
+    def calculate_metrics(
+        self, c1: np.ndarray, c2: np.ndarray, cashflows: np.ndarray, npv: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Calculate five-year loss, return, and payback metrics."""
+        c1_array = np.asarray(c1, dtype=np.float32)
+        c2_array = np.asarray(c2, dtype=np.float32)
+        cashflow_array = np.asarray(cashflows, dtype=np.float32)
+        expected_shape = (c1_array.shape[0], self.num_months)
+        self._validate_curve_shapes((c1_array, c2_array), expected_shape)
+        if cashflow_array.shape != expected_shape:
+            raise ValueError(f"cashflows must have shape {expected_shape}")
+        c1_array, c2_array = self._bound_curves((c1_array, c2_array, c1_array, c2_array))[:2]
 
-    def run(self, rdm_features, other_features):
-        """
-        End-to-end execution pipeline.
-        Returns a Pandas DataFrame with account level metrics.
-        """
-        # Step 1: Initial RDM regression
-        rdm = self.score_initial_rdm_model(rdm_features)
-        
-        # Step 2: 4 curve generation models using RDM
-        c1, c2, c3, c4 = self.score_curve_models(rdm, other_features)
-        
-        # Step 3: Combine outputs to get 99-month cashflows
-        cashflows = self.calculate_cashflows(c1, c2, c3, c4)
-        
-        # Step 4: Calculate Annual Loss Rate for Dynamic Discounting
-        annual_loss_rate = self.calculate_annual_loss_rate(c1, c2)
-        
-        # Step 5: Discount for NPV
-        npv = self.calculate_npv(cashflows, annual_loss_rate)
-        
-        # Step 5: Calculate Additional Metrics
-        net_loss_rate_5yr, roa_5yr, roe_5yr, payback_period = self.calculate_metrics(c1, c2, cashflows, npv)
-        
-        # Bundle into a dataframe for the user
-        results_df = pd.DataFrame({
-            "NPV": npv,
-            "5 Yr Net Loss Rate": net_loss_rate_5yr,
-            "5 Yr ROA": roa_5yr,
-            "5 Yr ROE": roe_5yr,
-            "Payback Period (Months)": payback_period
-        })
-        
-        return results_df
+        months_5yr = min(60, self.num_months)
+        c1_5yr = c1_array[:, :months_5yr]
+        c2_5yr = c2_array[:, :months_5yr]
+        cf_5yr = cashflow_array[:, :months_5yr]
+        avg_bal_5yr = np.mean(c2_5yr, axis=1, dtype=np.float64)
+        safe_avg_bal = np.where(avg_bal_5yr > 0.0, avg_bal_5yr, np.nan)
+
+        losses_5yr = np.sum((c1_5yr * self.lgd) * c2_5yr, axis=1, dtype=np.float64)
+        total_cf_5yr = np.sum(cf_5yr, axis=1, dtype=np.float64)
+        net_loss_rate_5yr = np.divide(
+            losses_5yr, safe_avg_bal, out=np.zeros_like(losses_5yr), where=np.isfinite(safe_avg_bal)
+        )
+        roa_5yr = np.divide(
+            total_cf_5yr, safe_avg_bal, out=np.zeros_like(total_cf_5yr), where=np.isfinite(safe_avg_bal)
+        )
+        avg_equity_5yr = safe_avg_bal * self.capital_requirement_rate
+        roe_5yr = np.divide(
+            total_cf_5yr, avg_equity_5yr, out=np.zeros_like(total_cf_5yr), where=np.isfinite(avg_equity_5yr)
+        )
+
+        payback_period = np.full(cashflow_array.shape[0], -1, dtype=np.int32)
+        for start in range(0, cashflow_array.shape[0], self.chunk_size):
+            end = min(start + self.chunk_size, cashflow_array.shape[0])
+            cumulative_cashflows = np.cumsum(cashflow_array[start:end], axis=1, dtype=np.float64)
+            positive_mask = cumulative_cashflows > 0.0
+            has_paid_back = np.any(positive_mask, axis=1)
+            first_positive = np.argmax(positive_mask, axis=1) + 1
+            payback_period[start:end] = np.where(has_paid_back, first_positive, -1)
+
+        return (
+            net_loss_rate_5yr.astype(np.float32),
+            roa_5yr.astype(np.float32),
+            roe_5yr.astype(np.float32),
+            payback_period,
+        )
+
+    def run(self, rdm_features: Any, other_features: Any) -> pd.DataFrame:
+        """Run the end-to-end pipeline without materializing all account-month data."""
+        rdm_array, other_array = self._validate_features(rdm_features, other_features)
+
+        num_accounts = rdm_array.shape[0]
+        result_arrays = {
+            "NPV": np.empty(num_accounts, dtype=np.float64),
+            "Annual Loss Rate": np.empty(num_accounts, dtype=np.float32),
+            "5 Yr Net Loss Rate": np.empty(num_accounts, dtype=np.float32),
+            "5 Yr ROA": np.empty(num_accounts, dtype=np.float32),
+            "5 Yr ROE": np.empty(num_accounts, dtype=np.float32),
+            "Payback Period (Months)": np.empty(num_accounts, dtype=np.int32),
+        }
+
+        for start in range(0, num_accounts, self.chunk_size):
+            end = min(start + self.chunk_size, num_accounts)
+            rdm = self.score_initial_rdm_model(rdm_array[start:end])
+            c1, c2, c3, c4 = self.score_curve_models(rdm, other_array[start:end])
+            cashflows = self.calculate_cashflows(c1, c2, c3, c4)
+            annual_loss_rate = self.calculate_annual_loss_rate(c1, c2)
+            npv = self.calculate_npv(cashflows)
+            metrics = self.calculate_metrics(c1, c2, cashflows, npv)
+
+            result_arrays["NPV"][start:end] = npv
+            result_arrays["Annual Loss Rate"][start:end] = annual_loss_rate
+            result_arrays["5 Yr Net Loss Rate"][start:end] = metrics[0]
+            result_arrays["5 Yr ROA"][start:end] = metrics[1]
+            result_arrays["5 Yr ROE"][start:end] = metrics[2]
+            result_arrays["Payback Period (Months)"][start:end] = metrics[3]
+
+        return pd.DataFrame(result_arrays)
 
 
 if __name__ == "__main__":
     NUM_ACCOUNTS = 1_000_000
     NUM_MONTHS = 99
-    
+
     print(f"Generating synthetic characteristics for {NUM_ACCOUNTS:,} accounts...")
-    
-    # Generate 5 characteristics for the initial regression model (RDM)
-    synthetic_rdm_features = np.random.randn(NUM_ACCOUNTS, 5).astype(np.float32)
-    
-    # Generate 3 additional characteristics for the downstream curve regression models
-    synthetic_other_features = np.random.randn(NUM_ACCOUNTS, 3).astype(np.float32)
-    
-    # Initialize engine
-    engine = AccountNPVEngine(num_months=NUM_MONTHS)
-    
-    print("Running Vectorized NPV Engine...")
+    synthetic_rdm_features = np.random.default_rng(42).normal(
+        size=(NUM_ACCOUNTS, 5)
+    ).astype(np.float32)
+    synthetic_other_features = np.random.default_rng(43).normal(
+        size=(NUM_ACCOUNTS, 3)
+    ).astype(np.float32)
+
+    engine = AccountNPVEngine(
+        num_months=NUM_MONTHS,
+        chunk_size=10_000,
+        allow_demo_fallback=True,
+    )
+
+    print("Running vectorized NPV engine in chunks...")
     start_time = time.time()
-    
-    # Execute Pipeline
     results_df = engine.run(synthetic_rdm_features, synthetic_other_features)
-    
     end_time = time.time()
-    
-    # Print statistics
+
     print("-" * 50)
     print(f"Engine completed in: {end_time - start_time:.4f} seconds.")
-    print(f"Accounts Processed : {NUM_ACCOUNTS:,}")
+    print(f"Accounts processed : {NUM_ACCOUNTS:,}")
     print(f"Months on book     : {NUM_MONTHS}")
-    print(f"\nSample Account Results (First 5):")
+    print("\nSample account results (first 5):")
     print(results_df.head(5).to_string())
     print("-" * 50)
